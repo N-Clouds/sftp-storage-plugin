@@ -1,0 +1,20 @@
+{
+    "name": "n-clouds/sftp-storage-plugin",
+    "description": "SFTP Storage Provider Plugin for VitoDeploy",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "N-Clouds",
+            "homepage": "https://github.com/N-Clouds"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "App\\Vito\\Plugins\\NClouds\\SftpStoragePlugin\\": ""
+        }
+    },
+    "require": {
+        "php": "^8.2"
+    }
+}
