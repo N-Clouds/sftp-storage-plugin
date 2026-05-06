@@ -4,30 +4,34 @@ namespace App\Vito\Plugins\NClouds\SftpStoragePlugin;
 
 use App\Exceptions\SSHError;
 use App\SSH\Storage\AbstractStorage;
+use Illuminate\Contracts\View\View;
 
 class SftpStorage extends AbstractStorage
 {
+    private const string VIEW_NAMESPACE = 'sftp-storage';
+
     /**
      * Upload file to SFTP server.
-     *
-     * @param string $src  Local file path on the worker server
-     * @param string $dest Full remote path from BackupFile::path()
      *
      * @throws SSHError
      */
     public function upload(string $src, string $dest): array
     {
         $destPath = '/' . ltrim($dest, '/');
-        $destDir = dirname($destPath);
+        $batchCmds = $this->buildMkdirBatchCmds(dirname($destPath));
+        $batchCmds .= 'put ' . $this->quoteSftpPath($src) . ' ' . $this->quoteSftpPath($destPath) . "\n";
 
         $this->server->ssh()->exec(
-            $this->buildUploadScript($src, $destPath, $destDir),
+            $this->view('scripts.upload', [
+                ...$this->authVars(),
+                'batchCmds' => $batchCmds,
+                'errorMsg'  => escapeshellarg("SFTP upload failed for {$src} -> {$destPath}"),
+            ]),
             'upload-to-sftp'
         );
 
-        // Get file size from the worker host
         $size = (int) $this->server->ssh()->exec(
-            "stat -c%s " . escapeshellarg($src) . " 2>/dev/null || echo 0",
+            'stat -c%s ' . escapeshellarg($src) . ' 2>/dev/null || echo 0',
             'get-file-size'
         );
 
@@ -39,45 +43,24 @@ class SftpStorage extends AbstractStorage
     /**
      * Download file from SFTP server.
      *
-     * @param string $src  Full remote path from BackupFile::path()
-     * @param string $dest Local destination path on the worker server
-     *
      * @throws SSHError
      */
     public function download(string $src, string $dest): void
     {
         $srcPath = '/' . ltrim($src, '/');
 
-        $host = $this->cred('host');
-        $port = (int) $this->cred('port');
-        $username = $this->cred('username');
-        $password = $this->escapeForPhp($this->cred('password') ?? '');
-
-        $script = <<<BASH
-if ! php -r "extension_loaded('ssh2') or exit(1);" 2>/dev/null; then
-    apt-get install -y php-ssh2 > /dev/null 2>&1
-fi
-mkdir -p $(dirname "{$dest}")
-php -r '
-\$conn = ssh2_connect("{$host}", {$port});
-if (!\$conn) { fwrite(STDERR, "SSH2: connect failed\n"); exit(1); }
-if (!ssh2_auth_password(\$conn, "{$username}", "{$password}")) { fwrite(STDERR, "SSH2: auth failed\n"); exit(1); }
-\$sftp = ssh2_sftp(\$conn);
-if (!\$sftp) { fwrite(STDERR, "SSH2: sftp init failed\n"); exit(1); }
-if (!ssh2_scp_recv(\$conn, "{$srcPath}", "{$dest}")) {
-    fwrite(STDERR, "SSH2: download failed for {$srcPath}\n"); exit(1);
-}
-echo "downloaded {$srcPath} to {$dest}\n";
-'
-BASH;
-
-        $this->server->ssh()->exec($script, 'download-from-sftp');
+        $this->server->ssh()->exec(
+            $this->view('scripts.download', [
+                ...$this->authVars(),
+                'srcPath' => escapeshellarg($srcPath),
+                'dest'    => escapeshellarg($dest),
+            ]),
+            'download-from-sftp'
+        );
     }
 
     /**
      * Delete file from SFTP server.
-     *
-     * @param string $src Full remote path from BackupFile::path()
      *
      * @throws SSHError
      */
@@ -88,85 +71,80 @@ BASH;
         }
 
         $srcPath = '/' . ltrim($src, '/');
+        $batchCmds = 'rm ' . $this->quoteSftpPath($srcPath) . "\n";
 
-        $host = $this->cred('host');
-        $port = (int) $this->cred('port');
-        $username = $this->cred('username');
-        $password = $this->escapeForPhp($this->cred('password') ?? '');
-
-        $script = <<<BASH
-if ! php -r "extension_loaded('ssh2') or exit(1);" 2>/dev/null; then
-    apt-get install -y php-ssh2 > /dev/null 2>&1
-fi
-php -r '
-\$conn = ssh2_connect("{$host}", {$port});
-if (!\$conn) { fwrite(STDERR, "SSH2: connect failed\n"); exit(1); }
-if (!ssh2_auth_password(\$conn, "{$username}", "{$password}")) { fwrite(STDERR, "SSH2: auth failed\n"); exit(1); }
-\$sftp = ssh2_sftp(\$conn);
-if (!\$sftp) { fwrite(STDERR, "SSH2: sftp init failed\n"); exit(1); }
-if (@ssh2_sftp_stat(\$sftp, "{$srcPath}") !== false) {
-    if (!ssh2_sftp_unlink(\$sftp, "{$srcPath}")) {
-        fwrite(STDERR, "SSH2: delete failed for {$srcPath}\n"); exit(1);
-    }
-    echo "deleted {$srcPath}\n";
-} else {
-    echo "not found, skipping: {$srcPath}\n";
-}
-'
-BASH;
-
-        $this->server->ssh()->exec($script, 'delete-from-sftp');
+        $this->server->ssh()->exec(
+            $this->view('scripts.delete-file', [
+                ...$this->authVars(),
+                'batchCmds' => $batchCmds,
+            ]),
+            'delete-from-sftp'
+        );
     }
 
-    private function buildUploadScript(string $src, string $destPath, string $destDir): string
+    // -------------------------------------------------------------------------
+    //  Helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Render a Blade view, ensuring the view namespace is registered.
+     */
+    private function view(string $template, array $data): View
     {
-        $host = $this->cred('host');
-        $port = (int) $this->cred('port');
-        $username = $this->cred('username');
-        $password = $this->escapeForPhp($this->cred('password') ?? '');
+        $finder = app('view')->getFinder();
 
-        // Build mkdir commands for each directory level
-        $mkdirCode = '';
+        if (! isset($finder->getHints()[self::VIEW_NAMESPACE])) {
+            app('view')->addNamespace(self::VIEW_NAMESPACE, __DIR__ . '/views');
+        }
+
+        return view(self::VIEW_NAMESPACE . '::' . $template, $data);
+    }
+
+    /**
+     * Common auth-related variables for all views.
+     */
+    private function authVars(): array
+    {
+        return [
+            'useKeyAuth' => ! empty($this->cred('private_key')),
+            'privateKey'  => $this->cred('private_key') ?? '',
+            'password'    => escapeshellarg($this->cred('password') ?? ''),
+            'host'        => escapeshellarg($this->cred('host')),
+            'port'        => (int) $this->cred('port'),
+            'username'    => escapeshellarg($this->cred('username')),
+        ];
+    }
+
+    /**
+     * Build sftp -mkdir batch commands for each directory level.
+     */
+    private function buildMkdirBatchCmds(string $destDir): string
+    {
+        $cmds = '';
         $parts = explode('/', ltrim($destDir, '/'));
         $current = '';
+
         foreach ($parts as $part) {
             if ($part === '') {
                 continue;
             }
             $current .= '/' . $part;
-            $mkdirCode .= "@ssh2_sftp_mkdir(\$sftp, \"{$current}\", 0755, false); ";
+            $cmds .= '-mkdir ' . $this->quoteSftpPath($current) . "\n";
         }
 
-        return <<<BASH
-if ! php -r "extension_loaded('ssh2') or exit(1);" 2>/dev/null; then
-    apt-get install -y php-ssh2 > /dev/null 2>&1
-fi
-php -r '
-\$conn = ssh2_connect("{$host}", {$port});
-if (!\$conn) { fwrite(STDERR, "SSH2: connect failed\n"); exit(1); }
-if (!ssh2_auth_password(\$conn, "{$username}", "{$password}")) { fwrite(STDERR, "SSH2: auth failed\n"); exit(1); }
-\$sftp = ssh2_sftp(\$conn);
-if (!\$sftp) { fwrite(STDERR, "SSH2: sftp init failed\n"); exit(1); }
-{$mkdirCode}
-if (!ssh2_scp_send(\$conn, "{$src}", "{$destPath}", 0644)) {
-    fwrite(STDERR, "SSH2: upload failed for {$src} -> {$destPath}\n");
-    exit(1);
-}
-echo "uploaded {$src} to {$destPath}\n";
-'
-BASH;
+        return $cmds;
+    }
+
+    /**
+     * Quote a path for use in sftp batch commands.
+     */
+    private function quoteSftpPath(string $path): string
+    {
+        return '"' . str_replace('"', '\\"', $path) . '"';
     }
 
     private function cred(string $key): mixed
     {
         return $this->storageProvider->credentials[$key] ?? null;
-    }
-
-    /**
-     * Escape string for use in PHP double-quoted string.
-     */
-    private function escapeForPhp(string $value): string
-    {
-        return addcslashes($value, '"\\$');
     }
 }

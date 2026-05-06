@@ -23,8 +23,8 @@ class SftpStorageProvider extends AbstractStorageProvider
             'host'        => 'required|string',
             'port'        => 'required|numeric|min:1|max:65535',
             'username'    => 'required|string',
-            'password'    => 'nullable|string',
-            'private_key' => 'nullable|string',
+            'password'    => 'required_without:private_key|nullable|string',
+            'private_key' => 'required_without:password|nullable|string',
             'path'        => 'required|string',
         ];
     }
@@ -38,12 +38,17 @@ class SftpStorageProvider extends AbstractStorageProvider
         $path = $input['path'] ?? '/';
         $path = rtrim($path, '/') ?: '/';
 
+        $privateKey = $input['private_key'] ?? null;
+        if (! empty($privateKey)) {
+            $privateKey = $this->normalizePrivateKey($privateKey);
+        }
+
         return [
             'host'        => $input['host'],
             'port'        => (int) $input['port'],
             'username'    => $input['username'],
             'password'    => $input['password'] ?? null,
-            'private_key' => $input['private_key'] ?? null,
+            'private_key' => $privateKey,
             'path'        => $path,
         ];
     }
@@ -97,6 +102,31 @@ class SftpStorageProvider extends AbstractStorageProvider
     public function ssh(Server $server): Storage
     {
         return new SftpStorage($server, $this->storageProvider);
+    }
+
+    /**
+     * Normalize a private key that may have been pasted without newlines.
+     */
+    private function normalizePrivateKey(string $key): string
+    {
+        $key = trim($key);
+
+        // Already has newlines — just normalize line endings
+        if (str_contains($key, "\n")) {
+            return str_replace("\r\n", "\n", $key);
+        }
+
+        // Single-line paste: reconstruct the PEM structure
+        // Matches both "BEGIN OPENSSH PRIVATE KEY" and "BEGIN RSA PRIVATE KEY" etc.
+        if (preg_match('/^(-----BEGIN [A-Z ]+-----)\s*(.+?)\s*(-----END [A-Z ]+-----)$/', $key, $m)) {
+            $body = trim($m[2]);
+            // Split the base64 body into 70-char lines
+            $body = wordwrap($body, 70, "\n", true);
+
+            return $m[1] . "\n" . $body . "\n" . $m[3] . "\n";
+        }
+
+        return $key;
     }
 
     /**

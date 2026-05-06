@@ -6,6 +6,7 @@ use App\DTOs\DynamicField;
 use App\DTOs\DynamicForm;
 use App\Plugins\AbstractPlugin;
 use App\Plugins\RegisterStorageProvider;
+use App\Plugins\RegisterViews;
 
 class Plugin extends AbstractPlugin
 {
@@ -15,6 +16,10 @@ class Plugin extends AbstractPlugin
 
     public function boot(): void
     {
+        RegisterViews::make('sftp-storage')
+            ->path(__DIR__ . '/views')
+            ->register();
+
         RegisterStorageProvider::make('ftp')
             ->label('SFTP')
             ->handler(SftpStorageProvider::class)
@@ -40,7 +45,7 @@ class Plugin extends AbstractPlugin
                         ->description('Leave empty if using SSH key authentication'),
 
                     DynamicField::make('private_key')
-                        ->text()
+                        ->textarea()
                         ->label('Private Key')
                         ->description('PEM-formatted SSH private key (optional, alternative to password)'),
 
